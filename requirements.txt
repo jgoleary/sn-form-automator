@@ -1,0 +1,7 @@
+anthropic
+chromadb
+pdfplumber
+python-docx
+playwright
+pyyaml
+python-dotenv

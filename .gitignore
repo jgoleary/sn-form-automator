@@ -1,0 +1,6 @@
+.env
+vector_store/
+knowledge_base/
+profile.yaml
+__pycache__/
+*.pyc
