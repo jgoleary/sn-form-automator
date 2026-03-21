@@ -60,12 +60,11 @@ def is_essay_field(field: dict) -> bool:
     return field["type"] in ("textarea", "quill")
 
 
-def generate_all_short_answers(fields: list[dict], profile: dict) -> dict[str, str]:
+def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> dict[str, str]:
     """
-    Answer all short (non-essay) fields in a single API call.
+    Answer every form field — short and essay — in a single API call.
     Returns a dict mapping field label → answer string.
     """
-    # Build a compact field list for the prompt
     field_specs = []
     for f in fields:
         spec = {"label": f["label"], "type": f["type"]}
@@ -73,25 +72,31 @@ def generate_all_short_answers(fields: list[dict], profile: dict) -> dict[str, s
             readable = [o["text"] for o in f["options"] if o.get("text") and o["text"] not in ("--", "Select an option...")]
             if readable:
                 spec["options"] = readable
+        if is_essay_field(f):
+            spec["essay"] = True
         field_specs.append(spec)
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{
             "role": "user",
             "content": (
-                "You are filling out a form for a special needs child. "
-                "Answer every field below using the profile provided.\n\n"
-                "Return a single JSON object where each key is the exact field label "
-                "and the value is the answer string. No explanation, no markdown.\n\n"
+                "You are filling out an intake form for a special needs child, written from the parent's perspective.\n\n"
+                "Answer EVERY field below. Return a single JSON object where each key is the exact field label "
+                "and the value is the answer string. No explanation, no markdown fences.\n\n"
                 "Rules:\n"
-                "- For yes/no fields, return 'yes' or 'no'\n"
-                "- For date fields, use MM/DD/YYYY\n"
-                "- For phone fields, use (XXX) XXX-XXXX\n"
-                "- For select/checkbox fields with options, return one of the listed options exactly as written\n"
-                "- If you cannot determine a confident answer, use the value NEEDS_REVIEW\n\n"
+                "- Short fields: return a concise value only\n"
+                "- Essay fields (marked essay:true): write 2–5 sentences in first person as the parent, "
+                "drawing on specific details from the profile and documents. Flowing prose, no bullet points.\n"
+                "- For yes/no fields: return 'yes' or 'no'\n"
+                "- For date fields: use MM/DD/YYYY\n"
+                "- For phone fields: use (XXX) XXX-XXXX\n"
+                "- For select/checkbox fields with options: return one of the listed options exactly as written\n"
+                "- Do not fabricate details not found in the profile or documents\n"
+                "- If you cannot determine a confident answer: use NEEDS_REVIEW\n\n"
                 f"Profile:\n{yaml.dump(profile, default_flow_style=False)}\n\n"
+                f"Relevant document excerpts:\n{kb_context}\n\n"
                 f"Fields:\n{json.dumps(field_specs, indent=2)}\n\n"
                 "JSON:"
             ),
@@ -101,34 +106,6 @@ def generate_all_short_answers(fields: list[dict], profile: dict) -> dict[str, s
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:-1])
     return json.loads(raw)
-
-
-def generate_essay_answer(label: str, profile: dict, context: str) -> str:
-    """Generate a narrative paragraph answer for an open-ended essay question."""
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": (
-                "You are helping a parent fill out an intake form for their special needs child. "
-                "Write a response to the following open-ended question in the first person, "
-                "as if the parent is writing it.\n\n"
-                f"Question: {label}\n\n"
-                f"Child's profile:\n{yaml.dump(profile, default_flow_style=False)}\n\n"
-                f"Relevant excerpts from the child's documents (IEPs, evaluations, etc.):\n{context}\n\n"
-                "Instructions:\n"
-                "- Write 2–5 sentences as a natural, honest parent response\n"
-                "- Draw on specific details from the documents and profile where available\n"
-                "- Do not use bullet points or headers — write flowing prose\n"
-                "- Do not fabricate specific details not found in the documents or profile\n"
-                "- If there is genuinely not enough information to answer, respond with exactly: NEEDS_REVIEW\n"
-                "- Do not include any preamble, just write the response\n\n"
-                "Response:"
-            ),
-        }],
-    )
-    return response.content[0].text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -346,44 +323,30 @@ async def run(url: str, sample: int = 0):
         print(f"Found {len(fields)} field(s). Generating answers (this may take a moment)...\n")
 
         fill_plan: list[dict] = []
-        pending_short = []   # fields to batch
-        pending_essays = []  # fields needing individual calls
+        pending = []  # fields that need answers
 
         for field in fields:
             essay = is_essay_field(field)
             if field.get("current_value", "").strip():
                 fill_plan.append({**field, "answer": None, "needs_review": False, "essay": essay, "prefilled": True})
-            elif essay:
-                pending_essays.append(field)
             else:
-                pending_short.append(field)
+                pending.append(field)
 
-        # --- One batch call for all short fields ---
-        short_answers: dict[str, str] = {}
-        if pending_short:
-            print(f"[1/2] Answering {len(pending_short)} short fields in one batch call...", flush=True)
-            try:
-                short_answers = generate_all_short_answers(pending_short, profile)
-                print(f"      Done.", flush=True)
-            except Exception as e:
-                print(f"      Batch call failed ({e}), falling back to individual calls...")
-                for f in pending_short:
-                    short_answers[f["label"]] = generate_essay_answer(f["label"], profile, query_kb(f["label"]))
+        # --- Single API call for all fields ---
+        if pending:
+            # Use essay questions as the KB query — they benefit most from document context
+            essay_labels = [f["label"] for f in pending if is_essay_field(f)]
+            kb_query = " ".join(essay_labels) if essay_labels else "child development therapy school"
+            kb_context = query_kb(kb_query, n=20)
 
-        for field in pending_short:
-            answer = short_answers.get(field["label"], "NEEDS_REVIEW")
-            fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": False, "prefilled": False})
+            print(f"Answering {len(pending)} fields in one API call...", flush=True)
+            answers = generate_all_answers(pending, profile, kb_context)
+            print(f"Done.", flush=True)
 
-        # --- Individual calls for essay fields (need full KB context) ---
-        n_essays = len(pending_essays)
-        if n_essays:
-            print(f"[2/2] Answering {n_essays} essay field(s) individually...", flush=True)
-        for i, field in enumerate(pending_essays, 1):
-            label = field["label"] or field["name"] or "(unlabeled)"
-            print(f"      [{i}/{n_essays}] {label[:70]}", flush=True)
-            context = query_kb(label, n=10)
-            answer = generate_essay_answer(label, profile, context)
-            fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": True, "prefilled": False})
+            for field in pending:
+                essay = is_essay_field(field)
+                answer = answers.get(field["label"], "NEEDS_REVIEW")
+                fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": essay, "prefilled": False})
 
         # --- Preview: short fields as a table, essays printed in full ---
         short_fields = [i for i in fill_plan if not i["essay"]]
