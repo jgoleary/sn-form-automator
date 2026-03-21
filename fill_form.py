@@ -55,6 +55,28 @@ def query_kb(question: str, n: int = 5) -> str:
         return ""
 
 
+def query_kb_for_essays(essay_fields: list[dict], n_per_question: int = 5) -> str:
+    """
+    Query the KB once per essay question and deduplicate results.
+    Returns more targeted context than a single combined query.
+    """
+    seen: set[str] = set()
+    chunks: list[str] = []
+    for field in essay_fields:
+        label = field["label"] or field["name"] or ""
+        if not label:
+            continue
+        try:
+            results = collection.query(query_texts=[label], n_results=n_per_question)
+            for doc in results["documents"][0]:
+                if doc not in seen:
+                    seen.add(doc)
+                    chunks.append(doc)
+        except Exception:
+            continue
+    return "\n\n".join(chunks)
+
+
 def is_essay_field(field: dict) -> bool:
     """Treat textareas and Quill rich-text editors as essay fields."""
     return field["type"] in ("textarea", "quill")
@@ -334,10 +356,9 @@ async def run(url: str, sample: int = 0):
 
         # --- Single API call for all fields ---
         if pending:
-            # Use essay questions as the KB query — they benefit most from document context
-            essay_labels = [f["label"] for f in pending if is_essay_field(f)]
-            kb_query = " ".join(essay_labels) if essay_labels else "child development therapy school"
-            kb_context = query_kb(kb_query, n=20)
+            # Query KB once per essay question and deduplicate — more targeted than one combined query
+            essay_fields = [f for f in pending if is_essay_field(f)]
+            kb_context = query_kb_for_essays(essay_fields) if essay_fields else ""
 
             print(f"Answering {len(pending)} fields in one API call...", flush=True)
             answers = generate_all_answers(pending, profile, kb_context)
