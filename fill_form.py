@@ -85,11 +85,13 @@ def is_essay_field(field: dict) -> bool:
 def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> dict[str, str]:
     """
     Answer every form field — short and essay — in a single API call.
+    Uses numeric indices as JSON keys to avoid repeating long question strings
+    in the output (which would exhaust the token limit on large forms).
     Returns a dict mapping field label → answer string.
     """
     field_specs = []
-    for f in fields:
-        spec = {"label": f["label"], "type": f["type"]}
+    for i, f in enumerate(fields):
+        spec = {"i": i, "label": f["label"], "type": f["type"]}
         if f["options"]:
             readable = [o["text"] for o in f["options"] if o.get("text") and o["text"] not in ("--", "Select an option...")]
             if readable:
@@ -105,7 +107,7 @@ def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> 
             "role": "user",
             "content": (
                 "You are filling out an intake form for a special needs child, written from the parent's perspective.\n\n"
-                "Answer EVERY field below. Return a single JSON object where each key is the exact field label "
+                "Answer EVERY field below. Return a single JSON object where each key is the field's integer index (\"i\") "
                 "and the value is the answer string. No explanation, no markdown fences.\n\n"
                 "Rules:\n"
                 "- Short fields: return a concise value only\n"
@@ -127,7 +129,9 @@ def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> 
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:-1])
-    return json.loads(raw)
+    by_index = json.loads(raw)
+    # Map back from index → label
+    return {fields[int(k)]["label"]: v for k, v in by_index.items()}
 
 
 # ---------------------------------------------------------------------------
