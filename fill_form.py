@@ -298,12 +298,14 @@ async def run(url: str, sample: int = 0):
     profile = load_profile()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(channel="chrome", headless=False)
         ctx = await browser.new_context()
         page = await ctx.new_page()
+        from playwright_stealth import Stealth
+        await Stealth().apply_stealth_async(page)
 
         print(f"\nOpening: {url}")
-        await page.goto(url)
+        await page.goto(url, wait_until="commit")
 
         print("\nIf the site requires login, do it now in the browser window.")
         input("Press Enter when you are on the form page and ready to continue... ")

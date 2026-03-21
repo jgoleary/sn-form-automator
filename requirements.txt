@@ -3,5 +3,6 @@ chromadb
 pdfplumber
 python-docx
 playwright
+playwright-stealth
 pyyaml
 python-dotenv
