@@ -60,39 +60,47 @@ def is_essay_field(field: dict) -> bool:
     return field["type"] in ("textarea", "quill")
 
 
-def generate_short_answer(label: str, field_type: str, options: list[dict], profile: dict, context: str) -> str:
-    """Generate a concise factual answer for a standard input field."""
-    options_text = ""
-    if options:
-        readable = [o["text"] for o in options if o.get("text") and o["text"] != "--"]
-        if readable:
-            options_text = f"\nAvailable options (you MUST pick one exactly as written): {', '.join(readable)}"
+def generate_all_short_answers(fields: list[dict], profile: dict) -> dict[str, str]:
+    """
+    Answer all short (non-essay) fields in a single API call.
+    Returns a dict mapping field label → answer string.
+    """
+    # Build a compact field list for the prompt
+    field_specs = []
+    for f in fields:
+        spec = {"label": f["label"], "type": f["type"]}
+        if f["options"]:
+            readable = [o["text"] for o in f["options"] if o.get("text") and o["text"] not in ("--", "Select an option...")]
+            if readable:
+                spec["options"] = readable
+        field_specs.append(spec)
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=300,
+        max_tokens=4096,
         messages=[{
             "role": "user",
             "content": (
                 "You are filling out a form for a special needs child. "
-                "Return ONLY the answer value — no explanation, no punctuation around it.\n\n"
-                f"Field label: {label}\n"
-                f"Field type: {field_type}"
-                f"{options_text}\n\n"
-                f"Profile:\n{yaml.dump(profile, default_flow_style=False)}\n\n"
-                f"Relevant document context:\n{context}\n\n"
+                "Answer every field below using the profile provided.\n\n"
+                "Return a single JSON object where each key is the exact field label "
+                "and the value is the answer string. No explanation, no markdown.\n\n"
                 "Rules:\n"
-                "- Return the answer only\n"
-                "- For yes/no or boolean fields, return 'yes' or 'no'\n"
+                "- For yes/no fields, return 'yes' or 'no'\n"
                 "- For date fields, use MM/DD/YYYY\n"
                 "- For phone fields, use (XXX) XXX-XXXX\n"
-                "- For select/dropdown, return one of the available options exactly as written\n"
-                "- If you cannot determine a confident answer, return NEEDS_REVIEW\n\n"
-                "Answer:"
+                "- For select/checkbox fields with options, return one of the listed options exactly as written\n"
+                "- If you cannot determine a confident answer, use the value NEEDS_REVIEW\n\n"
+                f"Profile:\n{yaml.dump(profile, default_flow_style=False)}\n\n"
+                f"Fields:\n{json.dumps(field_specs, indent=2)}\n\n"
+                "JSON:"
             ),
         }],
     )
-    return response.content[0].text.strip()
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:-1])
+    return json.loads(raw)
 
 
 def generate_essay_answer(label: str, profile: dict, context: str) -> str:
@@ -284,7 +292,7 @@ FIELD_EXTRACTOR_JS = """
 """
 
 
-async def run(url: str):
+async def run(url: str, sample: int = 0):
     from playwright.async_api import async_playwright
 
     profile = load_profile()
@@ -313,26 +321,67 @@ async def run(url: str):
             await browser.close()
             return
 
+        if sample:
+            # Pick a representative sample: try to include each field type
+            import random
+            by_type: dict[str, list] = {}
+            for f in fields:
+                by_type.setdefault(f["type"], []).append(f)
+            sampled = []
+            # Round-robin across types until we hit the sample size
+            buckets = list(by_type.values())
+            for bucket in buckets:
+                random.shuffle(bucket)
+            i = 0
+            while len(sampled) < sample and any(buckets):
+                bucket = buckets[i % len(buckets)]
+                if bucket:
+                    sampled.append(bucket.pop())
+                i += 1
+            fields = sampled
+            print(f"-- SAMPLE MODE: testing {len(fields)} of {len(by_type)} field types (no browser filling) --\n")
+
         print(f"Found {len(fields)} field(s). Generating answers (this may take a moment)...\n")
 
         fill_plan: list[dict] = []
-        for field in fields:
-            label = field["label"] or field["name"] or "(unlabeled)"
-            essay = is_essay_field(field)
+        pending_short = []   # fields to batch
+        pending_essays = []  # fields needing individual calls
 
-            # Skip fields already filled by the provider
+        for field in fields:
+            essay = is_essay_field(field)
             if field.get("current_value", "").strip():
                 fill_plan.append({**field, "answer": None, "needs_review": False, "essay": essay, "prefilled": True})
-                continue
-
-            # Retrieve more context for open-ended questions
-            context = query_kb(label, n=10 if essay else 5)
-            if essay:
-                answer = generate_essay_answer(label, profile, context)
+            elif essay:
+                pending_essays.append(field)
             else:
-                answer = generate_short_answer(label, field["type"], field["options"], profile, context)
-            needs_review = answer == "NEEDS_REVIEW"
-            fill_plan.append({**field, "answer": answer, "needs_review": needs_review, "essay": essay, "prefilled": False})
+                pending_short.append(field)
+
+        # --- One batch call for all short fields ---
+        short_answers: dict[str, str] = {}
+        if pending_short:
+            print(f"[1/2] Answering {len(pending_short)} short fields in one batch call...", flush=True)
+            try:
+                short_answers = generate_all_short_answers(pending_short, profile)
+                print(f"      Done.", flush=True)
+            except Exception as e:
+                print(f"      Batch call failed ({e}), falling back to individual calls...")
+                for f in pending_short:
+                    short_answers[f["label"]] = generate_essay_answer(f["label"], profile, query_kb(f["label"]))
+
+        for field in pending_short:
+            answer = short_answers.get(field["label"], "NEEDS_REVIEW")
+            fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": False, "prefilled": False})
+
+        # --- Individual calls for essay fields (need full KB context) ---
+        n_essays = len(pending_essays)
+        if n_essays:
+            print(f"[2/2] Answering {n_essays} essay field(s) individually...", flush=True)
+        for i, field in enumerate(pending_essays, 1):
+            label = field["label"] or field["name"] or "(unlabeled)"
+            print(f"      [{i}/{n_essays}] {label[:70]}", flush=True)
+            context = query_kb(label, n=10)
+            answer = generate_essay_answer(label, profile, context)
+            fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": True, "prefilled": False})
 
         # --- Preview: short fields as a table, essays printed in full ---
         short_fields = [i for i in fill_plan if not i["essay"]]
@@ -372,13 +421,20 @@ async def run(url: str):
         if flagged:
             print(f"{flagged} field(s) marked NEEDS_REVIEW will be skipped — fill them manually.")
 
+        if sample:
+            print("\n-- SAMPLE MODE: review complete. Re-run without --sample to fill the real form. --")
+            await browser.close()
+            return
+
         confirm = input("\nFill the form with these answers? [y/N] ").strip().lower()
         if confirm != "y":
             print("Cancelled.")
             await browser.close()
             return
 
-        print("\nFilling fields...")
+        n_to_fill = sum(1 for i in fill_plan if not i.get("prefilled") and not i["needs_review"] and i["answer"])
+        print(f"\nFilling {n_to_fill} fields...")
+        filled = 0
         for item in fill_plan:
             if item.get("prefilled") or item["needs_review"] or not item["answer"]:
                 continue
@@ -452,7 +508,8 @@ async def run(url: str):
                 else:
                     await locator.fill(item["answer"])
 
-                print(f"  Filled: {item['label'] or item['name']}")
+                filled += 1
+                print(f"  [{filled}/{n_to_fill}] {item['label'] or item['name']}", flush=True)
 
             except Exception as e:
                 print(f"  Could not fill '{item['label'] or item['name']}': {e}")
@@ -468,8 +525,11 @@ async def run(url: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python fill_form.py <url>")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("url", help="URL of the form to fill")
+    parser.add_argument("--sample", type=int, default=0,
+                        help="Test mode: only process this many fields (no browser filling)")
+    args = parser.parse_args()
 
-    asyncio.run(run(sys.argv[1]))
+    asyncio.run(run(args.url, sample=args.sample))
