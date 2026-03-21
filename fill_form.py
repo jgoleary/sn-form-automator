@@ -17,6 +17,7 @@ Flow:
 import sys
 import json
 import asyncio
+import time
 from pathlib import Path
 
 import yaml
@@ -82,24 +83,34 @@ def is_essay_field(field: dict) -> bool:
     return field["type"] in ("textarea", "quill")
 
 
-def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> dict[str, str]:
+def _call_claude(fields: list[dict], profile: dict, kb_context: str) -> dict[str, str]:
     """
-    Answer every form field — short and essay — in a single API call.
-    Uses numeric indices as JSON keys to avoid repeating long question strings
-    in the output (which would exhaust the token limit on large forms).
-    Returns a dict mapping field label → answer string.
+    Single API call for a batch of fields. Uses integer indices as JSON keys
+    to minimise output tokens. Returns a dict mapping field label → answer.
     """
     field_specs = []
     for i, f in enumerate(fields):
         spec = {"i": i, "label": f["label"], "type": f["type"]}
         if f["options"]:
-            readable = [o["text"] for o in f["options"] if o.get("text") and o["text"] not in ("--", "Select an option...")]
+            readable = [o["text"] for o in f["options"]
+                        if o.get("text") and o["text"] not in ("--", "Select an option...")]
             if readable:
                 spec["options"] = readable
-        if is_essay_field(f):
-            spec["essay"] = True
         field_specs.append(spec)
 
+    for attempt in range(4):
+        try:
+            return _call_claude_once(field_specs, fields, profile, kb_context)
+        except anthropic.RateLimitError as e:
+            if attempt == 3:
+                raise
+            wait = 60
+            print(f"  Rate limit hit, waiting {wait}s before retry {attempt + 2}/4...", flush=True)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+def _call_claude_once(field_specs, fields, profile, kb_context):
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8192,
@@ -110,9 +121,9 @@ def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> 
                 "Answer EVERY field below. Return a single JSON object where each key is the field's integer index (\"i\") "
                 "and the value is the answer string. No explanation, no markdown fences.\n\n"
                 "Rules:\n"
-                "- Short fields: return a concise value only\n"
-                "- Essay fields (marked essay:true): write 2–5 sentences in first person as the parent, "
-                "drawing on specific details from the profile and documents. Flowing prose, no bullet points.\n"
+                "- Answer each question at an appropriate length based on what it is asking. "
+                "A question like 'Date of birth' needs a date; a question like 'How does your child do with separations?' "
+                "needs a few honest sentences written in first person as the parent.\n"
                 "- For yes/no fields: return 'yes' or 'no'\n"
                 "- For date fields: use MM/DD/YYYY\n"
                 "- For phone fields: use (XXX) XXX-XXXX\n"
@@ -130,8 +141,36 @@ def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> 
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:-1])
     by_index = json.loads(raw)
-    # Map back from index → label
     return {fields[int(k)]["label"]: v for k, v in by_index.items()}
+
+
+QUILL_BATCH_SIZE = 80  # conservative: ~80 fields × ~50 tokens avg = ~4,000 output tokens
+
+
+def generate_all_answers(fields: list[dict], profile: dict, kb_context: str) -> dict[str, str]:
+    """
+    Answers all fields in batched API calls:
+      - Non-Quill fields (selects, checkboxes, inputs) in one call — always short answers
+      - Quill fields in chunks of QUILL_BATCH_SIZE — variable length, Claude decides
+    """
+    non_quill = [f for f in fields if f["type"] != "quill"]
+    quill     = [f for f in fields if f["type"] == "quill"]
+    chunks    = [quill[i:i + QUILL_BATCH_SIZE] for i in range(0, len(quill), QUILL_BATCH_SIZE)]
+    total     = (1 if non_quill else 0) + len(chunks)
+    step      = 0
+    answers: dict[str, str] = {}
+
+    if non_quill:
+        step += 1
+        print(f"  [{step}/{total}] {len(non_quill)} structured fields...", flush=True)
+        answers.update(_call_claude(non_quill, profile, ""))
+
+    for chunk in chunks:
+        step += 1
+        print(f"  [{step}/{total}] {len(chunk)} open-text fields...", flush=True)
+        answers.update(_call_claude(chunk, profile, kb_context))
+
+    return answers
 
 
 # ---------------------------------------------------------------------------
@@ -358,15 +397,13 @@ async def run(url: str, sample: int = 0):
             else:
                 pending.append(field)
 
-        # --- Single API call for all fields ---
+        # --- Generate answers ---
         if pending:
-            # Query KB once per essay question and deduplicate — more targeted than one combined query
-            essay_fields = [f for f in pending if is_essay_field(f)]
-            kb_context = query_kb_for_essays(essay_fields) if essay_fields else ""
+            quill_fields = [f for f in pending if f["type"] == "quill"]
+            kb_context = query_kb_for_essays(quill_fields) if quill_fields else ""
 
-            print(f"Answering {len(pending)} fields in one API call...", flush=True)
+            print(f"Generating answers for {len(pending)} fields...", flush=True)
             answers = generate_all_answers(pending, profile, kb_context)
-            print(f"Done.", flush=True)
 
             for field in pending:
                 essay = is_essay_field(field)
