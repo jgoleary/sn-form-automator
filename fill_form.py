@@ -56,8 +56,8 @@ def query_kb(question: str, n: int = 5) -> str:
 
 
 def is_essay_field(field: dict) -> bool:
-    """Treat textareas as essay fields."""
-    return field["type"] == "textarea"
+    """Treat textareas and Quill rich-text editors as essay fields."""
+    return field["type"] in ("textarea", "quill")
 
 
 def generate_short_answer(label: str, field_type: str, options: list[dict], profile: dict, context: str) -> str:
@@ -131,17 +131,17 @@ FIELD_EXTRACTOR_JS = """
 () => {
     const fields = [];
     const seen = new Set();
-    const inputs = document.querySelectorAll('input, select, textarea');
 
+    // --- Pass 1: standard input / select / textarea elements ---
+    const inputs = document.querySelectorAll('input, select, textarea');
     for (const el of inputs) {
         if (['hidden', 'submit', 'button', 'reset', 'image'].includes(el.type)) continue;
-        if (el.offsetParent === null) continue;  // skip hidden elements
+        if (el.offsetParent === null) continue;
+        // Skip inputs inside .chart-edit fieldsets — Pass 2 handles those as a group
+        if (el.closest('.chart-edit fieldset')) continue;
 
-        const key = el.id || el.name;
-        if (key && seen.has(key)) continue;
-        if (key) seen.add(key);
-
-        // Resolve label
+        // Resolve label first so we can use it as the dedup key.
+        // This handles JaneApp reusing generic names like "selected_option" across many selects.
         let label = '';
         if (el.id) {
             const lel = document.querySelector(`label[for="${el.id}"]`);
@@ -151,6 +151,14 @@ FIELD_EXTRACTOR_JS = """
             const wrapped = el.closest('label');
             if (wrapped) label = wrapped.innerText.replace(el.value || '', '').trim();
         }
+        // For selects inside .chart-edit, prefer the h5/legend question text as the label
+        if (!label || label.includes('Select an option')) {
+            const block = el.closest('.chart-edit');
+            if (block) {
+                const h5 = block.querySelector('h5');
+                if (h5) label = h5.innerText.trim();
+            }
+        }
         if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
         if (!label && el.placeholder) label = el.placeholder;
         if (!label && el.name) label = el.name.replace(/[_\\-]/g, ' ');
@@ -159,23 +167,31 @@ FIELD_EXTRACTOR_JS = """
             if (parent) label = parent.innerText.split('\\n')[0].trim().slice(0, 120);
         }
 
-        // Options for selects
+        // Deduplicate by label (preferred) or id/name fallback
+        const dedupKey = label || el.id || el.name;
+        if (dedupKey && seen.has(dedupKey)) continue;
+        if (dedupKey) seen.add(dedupKey);
+
         let options = [];
         if (el.tagName === 'SELECT') {
             options = Array.from(el.options).map(o => ({ value: o.value, text: o.text.trim() }));
         }
 
-        // Build a reliable selector
-        let selector = '';
-        if (el.id) selector = `#${CSS.escape(el.id)}`;
-        else if (el.name) selector = `[name="${el.name}"]`;
-        else selector = null;
+        // Normalize select type; browsers return "select-one" / "select-multiple"
+        const type = el.tagName === 'SELECT' ? 'select' : (el.type || el.tagName.toLowerCase());
 
-        if (!selector) continue;  // can't target this element reliably
+        // For selects that share a generic name (e.g. "selected_option"), build the
+        // selector from the question label via evaluate — store null and handle in fill loop.
+        let selector = null;
+        const sharedName = el.tagName === 'SELECT' && el.name &&
+                           document.querySelectorAll(`select[name="${el.name}"]`).length > 1;
+        if (el.id) selector = `#${CSS.escape(el.id)}`;
+        else if (el.name && !sharedName) selector = `[name="${el.name}"]`;
+        // else selector stays null → filled via evaluate() by question text
 
         fields.push({
             label,
-            type: el.type || el.tagName.toLowerCase(),
+            type,
             name: el.name,
             id: el.id,
             selector,
@@ -184,6 +200,85 @@ FIELD_EXTRACTOR_JS = """
             current_value: el.value || '',
         });
     }
+
+    // --- Pass 2: JaneApp checkbox/radio groups inside .chart-edit fieldsets ---
+    // These use visually-hidden inputs that all share name="option", so standard
+    // input detection misses the question and collapses all options into one entry.
+    const fieldsets = document.querySelectorAll('.chart-edit fieldset');
+    for (const fs of fieldsets) {
+        if (fs.offsetParent === null) continue;
+
+        // Question is in the <legend> (screen-reader text) or parent <h5>
+        let label = '';
+        const legend = fs.querySelector('legend');
+        if (legend) label = legend.innerText.trim();
+        if (!label) {
+            const block = fs.closest('.chart-edit');
+            if (block) {
+                const h5 = block.querySelector('h5');
+                if (h5) label = h5.innerText.trim();
+            }
+        }
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+
+        // Collect options and which are currently checked
+        const checkboxes = Array.from(fs.querySelectorAll('input[type="checkbox"]'));
+        const options = checkboxes.map(cb => ({ value: cb.value, text: cb.value }));
+        const checked = checkboxes.filter(cb => cb.getAttribute('aria-checked') === 'true' || cb.checked)
+                                   .map(cb => cb.value);
+        const current_value = checked.join(', ');
+
+        fields.push({
+            label,
+            type: 'janeapp-checkbox-group',
+            name: 'option',
+            id: '',
+            selector: null,          // filled via evaluate(), not a CSS selector
+            options,
+            required: false,
+            current_value,
+        });
+    }
+
+    // --- Pass 3: Quill rich-text editors (JaneApp uses these for open-ended questions) ---
+    const editors = document.querySelectorAll('.ql-editor[contenteditable="true"]');
+    for (const el of editors) {
+        if (el.offsetParent === null) continue;
+
+        // Label comes from aria-label (set by JaneApp to the question text)
+        // or from the nearest h5 inside the parent .chart-edit block
+        let label = el.getAttribute('aria-label') || '';
+        if (!label) {
+            const block = el.closest('.chart-edit');
+            if (block) {
+                const h5 = block.querySelector('h5');
+                if (h5) label = h5.innerText.trim();
+            }
+        }
+        if (!label || seen.has(label)) continue;
+        seen.add(label);
+
+        // Current content: empty Quill editors contain only whitespace / a lone <br>
+        const rawText = el.innerText.replace(/\\n/g, '').trim();
+        const current_value = (rawText === '' || rawText === '\\u200B') ? '' : el.innerText.trim();
+
+        // Selector: match on aria-label so it survives React re-renders
+        const escaped = label.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+        const selector = `.ql-editor[aria-label="${escaped}"]`;
+
+        fields.push({
+            label,
+            type: 'quill',
+            name: '',
+            id: '',
+            selector,
+            options: [],
+            required: false,
+            current_value,
+        });
+    }
+
     return fields;
 }
 """
@@ -206,6 +301,11 @@ async def run(url: str):
         input("Press Enter when you are on the form page and ready to continue... ")
 
         print("\nAnalyzing form fields...")
+        # Wait for Quill editors to render (JaneApp is a React SPA)
+        try:
+            await page.wait_for_selector('.ql-editor', timeout=8000)
+        except Exception:
+            pass  # No Quill editors on this form; continue with standard fields
         fields: list[dict] = await page.evaluate(FIELD_EXTRACTOR_JS)
 
         if not fields:
@@ -284,17 +384,54 @@ async def run(url: str):
                 continue
 
             try:
-                locator = page.locator(item["selector"]).first
                 ftype = item["type"]
+                locator = page.locator(item["selector"]).first if item.get("selector") else None
 
-                if ftype == "select":
-                    # Try matching by visible text first, fall back to value
+                if ftype == "janeapp-checkbox-group":
+                    # Click the label whose input value matches the answer.
+                    # Scoped by question text so same-named inputs in other fieldsets aren't touched.
+                    clicked = await page.evaluate(
+                        """([question, answer]) => {
+                            for (const fs of document.querySelectorAll('.chart-edit fieldset')) {
+                                const legend = fs.querySelector('legend');
+                                if (!legend || legend.innerText.trim() !== question) continue;
+                                for (const cb of fs.querySelectorAll('input[type="checkbox"]')) {
+                                    if (cb.value.toLowerCase() === answer.toLowerCase()) {
+                                        cb.closest('label').click();
+                                        return true;
+                                    }
+                                }
+                            }
+                            return false;
+                        }""",
+                        [item["label"], item["answer"]],
+                    )
+                    if not clicked:
+                        print(f"  Could not match option '{item['answer']}' for: {item['label']}")
+
+                elif ftype == "quill":
+                    # Playwright's fill() handles contenteditable natively and cross-platform
+                    await locator.fill(item["answer"])
+
+                elif ftype == "select":
                     opts = item["options"]
                     match = next((o for o in opts if o["text"].lower() == item["answer"].lower()), None)
-                    if match:
-                        await locator.select_option(value=match["value"])
+                    target_value = match["value"] if match else item["answer"]
+                    if locator:
+                        await locator.select_option(value=target_value)
                     else:
-                        await locator.select_option(label=item["answer"])
+                        # Shared name — scope to the right .chart-edit block by question text
+                        await page.evaluate(
+                            """([question, value]) => {
+                                for (const block of document.querySelectorAll('.chart-edit')) {
+                                    const h5 = block.querySelector('h5');
+                                    if (!h5 || h5.innerText.trim() !== question) continue;
+                                    const sel = block.querySelector('select');
+                                    if (sel) { sel.value = value; sel.dispatchEvent(new Event('change', {bubbles: true})); }
+                                }
+                            }""",
+                            [item["label"], target_value],
+                        )
 
                 elif ftype == "checkbox":
                     if item["answer"].lower() in ("yes", "true", "1", "on"):
@@ -303,7 +440,6 @@ async def run(url: str):
                         await locator.uncheck()
 
                 elif ftype == "radio":
-                    # Find the radio with matching label/value
                     radios = page.locator(f'[name="{item["name"]}"]')
                     count = await radios.count()
                     for i in range(count):

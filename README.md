@@ -6,10 +6,10 @@ Fills out repetitive online intake forms for a special needs child using your ex
 
 ```bash
 # 1. Install dependencies
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 # 2. Install Playwright's browser
-playwright install chromium
+python3 -m playwright install chromium
 
 # 3. Create your .env file
 cp .env.example .env
@@ -20,7 +20,7 @@ cp .env.example .env
 #    Examples: IEPs, therapy evaluations, school applications, intake forms you've filled before
 
 # 5. Ingest documents and auto-generate profile.yaml
-python ingest.py
+python3 ingest.py
 
 # 6. Open profile.yaml and review/correct the extracted info
 #    Fill in anything marked null
@@ -29,7 +29,7 @@ python ingest.py
 ## Filling a form
 
 ```bash
-python fill_form.py https://example.com/intake-form
+python3 fill_form.py https://example.com/intake-form
 ```
 
 1. Browser opens and navigates to the URL
@@ -47,7 +47,7 @@ Fields the script is unsure about are marked `*** REVIEW ***` and left blank for
 Drop files into `knowledge_base/` and re-run:
 
 ```bash
-python ingest.py
+python3 ingest.py
 ```
 
 Already-indexed documents are skipped automatically.
@@ -55,5 +55,5 @@ Already-indexed documents are skipped automatically.
 ## Re-extracting profile from scratch
 
 ```bash
-python ingest.py --reset-profile
+python3 ingest.py --reset-profile
 ```
