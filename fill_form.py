@@ -18,6 +18,7 @@ import sys
 import json
 import asyncio
 import time
+import hashlib
 from pathlib import Path
 
 import yaml
@@ -29,6 +30,11 @@ load_dotenv()
 
 PROFILE_PATH = Path("profile.yaml")
 VECTOR_DIR = Path("vector_store")
+CACHE_DIR = Path("cache")
+
+MODEL_PROD = "claude-sonnet-4-6"
+MODEL_DEV  = "claude-haiku-4-5-20251001"
+MODEL = MODEL_PROD  # overridden to MODEL_DEV when --dev is passed
 
 client = anthropic.Anthropic()
 chroma = chromadb.PersistentClient(path=str(VECTOR_DIR))
@@ -38,6 +44,25 @@ collection = chroma.get_or_create_collection("knowledge_base")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def cache_path(url: str) -> Path:
+    key = hashlib.md5(url.encode()).hexdigest()[:12]
+    return CACHE_DIR / f"{key}.json"
+
+
+def load_cache(url: str):
+    p = cache_path(url)
+    if p.exists():
+        with open(p) as f:
+            return json.load(f)
+    return None
+
+
+def save_cache(url: str, fill_plan: list):
+    CACHE_DIR.mkdir(exist_ok=True)
+    with open(cache_path(url), "w") as f:
+        json.dump(fill_plan, f, indent=2)
+
 
 def load_profile() -> dict:
     if not PROFILE_PATH.exists():
@@ -112,7 +137,7 @@ def _call_claude(fields: list[dict], profile: dict, kb_context: str) -> dict[str
 
 def _call_claude_once(field_specs, fields, profile, kb_context):
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODEL,
         max_tokens=8192,
         messages=[{
             "role": "user",
@@ -385,30 +410,41 @@ async def run(url: str, sample: int = 0):
             fields = sampled
             print(f"-- SAMPLE MODE: testing {len(fields)} of {len(by_type)} field types (no browser filling) --\n")
 
-        print(f"Found {len(fields)} field(s). Generating answers (this may take a moment)...\n")
+        print(f"Found {len(fields)} field(s).\n")
 
+        # --- Check for cached fill plan ---
         fill_plan: list[dict] = []
-        pending = []  # fields that need answers
+        cached = load_cache(url) if not sample else None
+        if cached:
+            use_cache = input(f"Found cached answers ({len(cached)} fields). Use them? [Y/n] ").strip().lower()
+            if use_cache != "n":
+                fill_plan = cached
+                print("Using cached answers — skipping API calls.\n")
 
-        for field in fields:
-            essay = is_essay_field(field)
-            if field.get("current_value", "").strip():
-                fill_plan.append({**field, "answer": None, "needs_review": False, "essay": essay, "prefilled": True})
-            else:
-                pending.append(field)
-
-        # --- Generate answers ---
-        if pending:
-            quill_fields = [f for f in pending if f["type"] == "quill"]
-            kb_context = query_kb_for_essays(quill_fields) if quill_fields else ""
-
-            print(f"Generating answers for {len(pending)} fields...", flush=True)
-            answers = generate_all_answers(pending, profile, kb_context)
-
-            for field in pending:
+        if not fill_plan:
+            pending = []
+            for field in fields:
                 essay = is_essay_field(field)
-                answer = answers.get(field["label"], "NEEDS_REVIEW")
-                fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": essay, "prefilled": False})
+                if field.get("current_value", "").strip():
+                    fill_plan.append({**field, "answer": None, "needs_review": False, "essay": essay, "prefilled": True})
+                else:
+                    pending.append(field)
+
+            # --- Generate answers ---
+            if pending:
+                quill_fields = [f for f in pending if f["type"] == "quill"]
+                kb_context = query_kb_for_essays(quill_fields) if quill_fields else ""
+
+                print(f"Generating answers for {len(pending)} fields...", flush=True)
+                answers = generate_all_answers(pending, profile, kb_context)
+
+                for field in pending:
+                    essay = is_essay_field(field)
+                    answer = answers.get(field["label"], "NEEDS_REVIEW")
+                    fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": essay, "prefilled": False})
+
+            save_cache(url, fill_plan)
+            print("Answers cached — future runs can reuse them.\n")
 
         # --- Preview: short fields as a table, essays printed in full ---
         short_fields = [i for i in fill_plan if not i["essay"]]
@@ -557,6 +593,13 @@ if __name__ == "__main__":
     parser.add_argument("url", help="URL of the form to fill")
     parser.add_argument("--sample", type=int, default=0,
                         help="Test mode: only process this many fields (no browser filling)")
+    parser.add_argument("--dev", action="store_true",
+                        help="Use claude-haiku (cheaper, ~4x) for development runs")
     args = parser.parse_args()
+
+    if args.dev:
+        import fill_form as _self
+        _self.MODEL = MODEL_DEV
+        print(f"[DEV MODE] Using {MODEL_DEV}\n")
 
     asyncio.run(run(args.url, sample=args.sample))

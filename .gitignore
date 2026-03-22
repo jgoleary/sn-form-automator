@@ -2,5 +2,6 @@
 vector_store/
 knowledge_base/
 profile.yaml
+cache/
 __pycache__/
 *.pyc

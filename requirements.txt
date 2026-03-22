@@ -6,3 +6,5 @@ playwright
 playwright-stealth
 pyyaml
 python-dotenv
+pytest
+pytest-asyncio
