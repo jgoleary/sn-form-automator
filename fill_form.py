@@ -142,19 +142,24 @@ def _call_claude_once(field_specs, fields, profile, kb_context):
         messages=[{
             "role": "user",
             "content": (
-                "You are filling out an intake form for a special needs child, written from the parent's perspective.\n\n"
+                "You are a parent filling out an intake form about your child. "
+                "You know your child intimately — you live with them every day. "
+                "Write every answer in your own voice, as if you are typing it yourself right now.\n\n"
                 "Answer EVERY field below. Return a single JSON object where each key is the field's integer index (\"i\") "
                 "and the value is the answer string. No explanation, no markdown fences.\n\n"
                 "Rules:\n"
-                "- Answer each question at an appropriate length based on what it is asking. "
-                "A question like 'Date of birth' needs a date; a question like 'How does your child do with separations?' "
-                "needs a few honest sentences written in first person as the parent.\n"
+                "- Write in first person (\"She loves...\", \"We've found that...\", \"He tends to...\").\n"
+                "- Match the answer length to the question: a bedtime question needs a time, "
+                "a question about sensory challenges needs a few genuine sentences.\n"
+                "- Sound warm and direct — like a parent talking to a therapist, not like a report.\n"
+                "- Never use phrases like 'noted in records', 'reported', 'according to documents', "
+                "'as per', 'it has been observed', or any other distancing language.\n"
+                "- Do not invent facts not supported by the profile or documents.\n"
                 "- For yes/no fields: return 'yes' or 'no'\n"
                 "- For date fields: use MM/DD/YYYY\n"
                 "- For phone fields: use (XXX) XXX-XXXX\n"
                 "- For select/checkbox fields with options: return one of the listed options exactly as written\n"
-                "- Do not fabricate details not found in the profile or documents\n"
-                "- If you cannot determine a confident answer: use NEEDS_REVIEW\n\n"
+                "- If you genuinely don't have enough information to answer, return an empty string \"\"\n\n"
                 f"Profile:\n{yaml.dump(profile, default_flow_style=False)}\n\n"
                 f"Relevant document excerpts:\n{kb_context}\n\n"
                 f"Fields:\n{json.dumps(field_specs, indent=2)}\n\n"
@@ -323,7 +328,8 @@ FIELD_EXTRACTOR_JS = """
 
         // Label comes from aria-label (set by JaneApp to the question text)
         // or from the nearest h5 inside the parent .chart-edit block
-        let label = el.getAttribute('aria-label') || '';
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        let label = ariaLabel;
         if (!label) {
             const block = el.closest('.chart-edit');
             if (block) {
@@ -331,6 +337,22 @@ FIELD_EXTRACTOR_JS = """
                 if (h5) label = h5.innerText.trim();
             }
         }
+
+        // If this Quill is a note field inside a .chart-edit fieldset (i.e. it sits next to a
+        // checkbox option), prefix the label with the parent question from the fieldset legend.
+        // Without this, labels like "yes" / "no" / "if yes, results:" give Claude no context
+        // about what section it's in (e.g. the vision test "yes" field got filled with diagnoses).
+        const parentFieldset = el.closest('.chart-edit fieldset');
+        if (parentFieldset) {
+            const legend = parentFieldset.querySelector('legend');
+            if (legend) {
+                const parentQuestion = legend.innerText.trim();
+                if (parentQuestion && label && parentQuestion !== label) {
+                    label = `${parentQuestion} — ${label}`;
+                }
+            }
+        }
+
         if (!label || seen.has(label)) continue;
         seen.add(label);
 
@@ -338,8 +360,10 @@ FIELD_EXTRACTOR_JS = """
         const rawText = el.innerText.replace(/\\n/g, '').trim();
         const current_value = (rawText === '' || rawText === '\\u200B') ? '' : el.innerText.trim();
 
-        // Selector: match on aria-label so it survives React re-renders
-        const escaped = label.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+        // Selector: must use the original aria-label from the DOM (not the prefixed label)
+        // so it can actually find the element during fill.
+        const selectorLabel = ariaLabel || label;
+        const escaped = selectorLabel.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
         const selector = `.ql-editor[aria-label="${escaped}"]`;
 
         fields.push({
@@ -440,8 +464,8 @@ async def run(url: str, sample: int = 0):
 
                 for field in pending:
                     essay = is_essay_field(field)
-                    answer = answers.get(field["label"], "NEEDS_REVIEW")
-                    fill_plan.append({**field, "answer": answer, "needs_review": answer == "NEEDS_REVIEW", "essay": essay, "prefilled": False})
+                    answer = answers.get(field["label"], "")
+                    fill_plan.append({**field, "answer": answer, "needs_review": not answer, "essay": essay, "prefilled": False})
 
             save_cache(url, fill_plan)
             print("Answers cached — future runs can reuse them.\n")
@@ -475,14 +499,14 @@ async def run(url: str, sample: int = 0):
                 if item.get("prefilled"):
                     print(f"A: (already filled, skipping) {item['current_value'][:80]}...")
                 elif item["needs_review"]:
-                    print("A: *** NEEDS_REVIEW — will be skipped, fill manually ***")
+                    print("A: (blank — fill manually)")
                 else:
                     print(f"A: {item['answer']}")
                 print()
 
         flagged = sum(1 for i in fill_plan if i["needs_review"])
         if flagged:
-            print(f"{flagged} field(s) marked NEEDS_REVIEW will be skipped — fill them manually.")
+            print(f"{flagged} field(s) left blank — fill them manually.")
 
         if sample:
             print("\n-- SAMPLE MODE: review complete. Re-run without --sample to fill the real form. --")

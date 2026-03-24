@@ -301,6 +301,78 @@ FIXTURE_HTML = """<!DOCTYPE html><html><body>
   </div>
 </div>
 
+
+<!-- Vision section: checkbox options with adjacent Quill note fields (real pattern from Hearing & Vision) -->
+<div class="chart-edit">
+  <div class="menu-toggle-container">
+    <div class="flex flex-left flex-inline flex-baseline">
+      <h5> Has your child had a vision test?</h5>
+    </div>
+  </div>
+  <div class="sensitive">
+    <fieldset>
+      <legend class="sr-only">Has your child had a vision test?</legend>
+      <div class="row">
+        <div class="col-sm-3">
+          <label data-e2e-id="e2e_checkbox" class="input-button">
+            <input type="checkbox" class="visually-hidden" name="option"
+                   aria-checked="false" value="yes">
+            <span>yes</span>
+          </label>
+        </div>
+        <div class="col-sm-9">
+          <div class="ql-wrapper">
+            <div class="ql-container ql-snow">
+              <div class="ql-editor ql-blank" contenteditable="true" role="textbox"
+                   aria-label="yes" aria-multiline="true">
+                <div><br></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col-sm-3">
+          <label data-e2e-id="e2e_checkbox" class="input-button">
+            <input type="checkbox" class="visually-hidden" name="option"
+                   aria-checked="false" value="no">
+            <span>no</span>
+          </label>
+        </div>
+        <div class="col-sm-9">
+          <div class="ql-wrapper">
+            <div class="ql-container ql-snow">
+              <div class="ql-editor ql-blank" contenteditable="true" role="textbox"
+                   aria-label="no" aria-multiline="true">
+                <div><br></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col-sm-3">
+          <label data-e2e-id="e2e_checkbox" class="input-button">
+            <input type="checkbox" class="visually-hidden" name="option"
+                   aria-checked="false" value="if yes, results:">
+            <span>if yes, results:</span>
+          </label>
+        </div>
+        <div class="col-sm-9">
+          <div class="ql-wrapper">
+            <div class="ql-container ql-snow">
+              <div class="ql-editor ql-blank" contenteditable="true" role="textbox"
+                   aria-label="if yes, results:" aria-multiline="true">
+                <div><br></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </fieldset>
+  </div>
+</div>
+
 </body></html>"""
 
 
@@ -546,6 +618,50 @@ async def test_signature_radio_inputs_not_captured_individually(form_page):
 
 
 # ---------------------------------------------------------------------------
+# Quill note fields inside checkbox fieldsets get parent question context
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_quill_note_field_label_prefixed_with_parent_question(form_page):
+    """Quill note fields inside a .chart-edit fieldset must be prefixed with the parent question.
+    Without this, labels like 'yes'/'no' give Claude no context about what section it's in."""
+    by_label = await _extract(form_page)
+    # Raw label "yes" should NOT appear as a standalone field
+    assert "yes" not in by_label
+    assert "no" not in by_label
+    assert "if yes, results:" not in by_label
+
+
+@pytest.mark.asyncio
+async def test_quill_note_field_prefixed_label_contains_parent_question(form_page):
+    """The prefixed label should include the parent section question."""
+    by_label = await _extract(form_page)
+    # Count only the prefixed note fields (those with " — "), not the checkbox group itself
+    prefixed = [l for l in by_label if "Has your child had a vision test? —" in l]
+    assert len(prefixed) == 3  # yes, no, if yes results
+
+
+@pytest.mark.asyncio
+async def test_quill_note_field_prefixed_label_format(form_page):
+    """Prefixed label format: '<parent question> — <option label>'."""
+    by_label = await _extract(form_page)
+    assert "Has your child had a vision test? — yes" in by_label
+    assert "Has your child had a vision test? — no" in by_label
+    assert "Has your child had a vision test? — if yes, results:" in by_label
+
+
+@pytest.mark.asyncio
+async def test_quill_note_field_selector_uses_original_aria_label(form_page):
+    """The CSS selector must still use the original aria-label (not the prefixed one)
+    so it matches the actual DOM element."""
+    by_label = await _extract(form_page)
+    field = by_label["Has your child had a vision test? — if yes, results:"]
+    assert field["type"] == "quill"
+    # Selector must use the original DOM aria-label, not the prefixed display label
+    assert field["selector"] == '.ql-editor[aria-label="if yes, results:"]'
+
+
+# ---------------------------------------------------------------------------
 # is_essay_field
 # ---------------------------------------------------------------------------
 
@@ -703,16 +819,16 @@ def test_generate_all_answers_all_field_types():
     assert "kitchen table" in answers["Describe a typical meal."]
 
 
-def test_generate_all_answers_needs_review_fallback():
-    """Fields Claude can't answer should be NEEDS_REVIEW."""
+def test_generate_all_answers_unknown_field_returns_empty():
+    """Fields Claude can't answer should return empty string so they're left blank."""
     fields = [{"label": "Unknown field", "type": "text", "options": []}]
-    mock_resp = _make_mock_response({"0": "NEEDS_REVIEW"})
+    mock_resp = _make_mock_response({"0": ""})
 
     with patch.object(fill_form, "client") as mock_client:
         mock_client.messages.create.return_value = mock_resp
         answers = generate_all_answers(fields, {}, "")
 
-    assert answers["Unknown field"] == "NEEDS_REVIEW"
+    assert answers["Unknown field"] == ""
 
 
 def test_generate_all_answers_quill_chunked():
