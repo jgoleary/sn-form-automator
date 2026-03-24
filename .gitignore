@@ -5,3 +5,5 @@ profile.yaml
 cache/
 __pycache__/
 *.pyc
+.DS_Store
+*.png
