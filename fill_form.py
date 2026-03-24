@@ -14,11 +14,13 @@ Flow:
     7. You review / edit / submit manually
 """
 
+import re
 import sys
 import json
 import asyncio
 import time
 import hashlib
+from datetime import date, datetime
 from pathlib import Path
 
 import yaml
@@ -70,6 +72,28 @@ def load_profile() -> dict:
         sys.exit(1)
     with open(PROFILE_PATH) as f:
         return yaml.safe_load(f) or {}
+
+
+def is_age_field(field: dict) -> bool:
+    """Return True if this field is asking for the child's age."""
+    label = field.get("label", "").lower()
+    return bool(re.search(r'\bage\b', label))
+
+
+def derive_age(profile: dict) -> str:
+    """Calculate the child's current age in years from profile.child.dob."""
+    dob_raw = profile.get("child", {}).get("dob")
+    if not dob_raw:
+        return ""
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"):
+        try:
+            dob = datetime.strptime(str(dob_raw), fmt).date()
+            today = date.today()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            return str(age)
+        except ValueError:
+            continue
+    return ""
 
 
 def query_kb(question: str, n: int = 5) -> str:
@@ -151,7 +175,8 @@ def _call_claude_once(field_specs, fields, profile, kb_context):
                 "- Write in first person (\"She loves...\", \"We've found that...\", \"He tends to...\").\n"
                 "- Match the answer length to the question: a bedtime question needs a time, "
                 "a question about sensory challenges needs a few genuine sentences.\n"
-                "- Sound warm and direct — like a parent talking to a therapist, not like a report.\n"
+                "- Sound warm and direct, like a parent talking to a therapist, not like a report.\n"
+                "- Do not use em dashes (—). Use commas, periods, or plain conjunctions instead.\n"
                 "- Never use phrases like 'noted in records', 'reported', 'according to documents', "
                 "'as per', 'it has been observed', or any other distancing language.\n"
                 "- Do not invent facts not supported by the profile or documents.\n"
@@ -451,6 +476,12 @@ async def run(url: str, sample: int = 0):
                 essay = is_essay_field(field)
                 if field.get("current_value", "").strip():
                     fill_plan.append({**field, "answer": None, "needs_review": False, "essay": essay, "prefilled": True})
+                elif is_age_field(field):
+                    age = derive_age(profile)
+                    if age:
+                        fill_plan.append({**field, "answer": age, "needs_review": False, "essay": False, "prefilled": False})
+                    else:
+                        pending.append(field)
                 else:
                     pending.append(field)
 

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch, call
 from playwright.async_api import async_playwright
 
 import fill_form
-from fill_form import FIELD_EXTRACTOR_JS, generate_all_answers, is_essay_field
+from fill_form import FIELD_EXTRACTOR_JS, generate_all_answers, is_essay_field, is_age_field, derive_age
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +682,54 @@ def test_is_essay_field_range():
 
 def test_is_essay_field_text():
     assert is_essay_field({"type": "text"}) is False
+
+
+# ---------------------------------------------------------------------------
+# is_age_field / derive_age
+# ---------------------------------------------------------------------------
+
+def test_is_age_field_plain():
+    assert is_age_field({"label": "Age"}) is True
+
+def test_is_age_field_phrase():
+    assert is_age_field({"label": "Child's age"}) is True
+
+def test_is_age_field_not_stage():
+    """'stage' contains 'age' but should not match — word boundary check."""
+    assert is_age_field({"label": "Stage of development"}) is False
+
+def test_is_age_field_not_language():
+    assert is_age_field({"label": "Primary language"}) is False
+
+def test_is_age_field_case_insensitive():
+    assert is_age_field({"label": "AGE OF CHILD"}) is True
+
+
+def test_derive_age_iso_format():
+    from datetime import date
+    profile = {"child": {"dob": "2018-05-01"}}
+    age = int(derive_age(profile))
+    today = date.today()
+    expected = today.year - 2018 - ((today.month, today.day) < (5, 1))
+    assert age == expected
+
+def test_derive_age_us_format():
+    from datetime import date
+    profile = {"child": {"dob": "05/01/2018"}}
+    age = int(derive_age(profile))
+    today = date.today()
+    expected = today.year - 2018 - ((today.month, today.day) < (5, 1))
+    assert age == expected
+
+def test_derive_age_no_dob_returns_empty():
+    assert derive_age({}) == ""
+    assert derive_age({"child": {}}) == ""
+
+def test_derive_age_returns_string():
+    profile = {"child": {"dob": "2018-05-01"}}
+    result = derive_age(profile)
+    assert isinstance(result, str)
+    assert result.isdigit()
 
 
 # ---------------------------------------------------------------------------
